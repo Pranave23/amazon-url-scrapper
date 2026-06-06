@@ -4,25 +4,15 @@ amazon_scraper_final.py
 Scrapes all colour variants and their high-resolution image URLs
 from an Amazon UK product page.
 
-Fixes applied vs all previous versions:
-  - clean_image_url() uses anchored regex that catches every known
-    Amazon modifier pattern (_AC_SX679_, _SS40_, _SL1500_, _CR0,0,..._)
-  - clean_image_url() is applied to EVERY URL path including
-    data-a-dynamic-image (was missing in all previous versions)
-  - scroll_thumbnail_strip() triggers lazy loading before reading
-    thumbnails — fixes the "7 instead of 8" missing image problem
-  - collect_all_images_by_clicking_thumbnails() clicks each thumbnail
-    individually and reads the main viewer — fixes duplicates and
-    ensures the correct image loads for each slot
-  - Deduplication uses the Amazon asset ID (the image hash in the URL)
-    not the full URL — prevents the same image appearing twice under
-    different modifier strings
-  - browser.close() is guaranteed via try/finally — no browser leaks
-  - matched_selector stored and reused for stable re-querying of
-    swatch elements after DOM updates
-  - Soft-block detection added (200 response but bot-detection page)
-  - wait_for_gallery_ready() waits for DOM change after swatch click,
-    not just for any visible image
+Approach for image collection (intentionally simple):
+  1. After clicking a colour swatch, read data-a-dynamic-image on
+     img#landingImage — this gives the hero image at max resolution.
+  2. Scroll the thumbnail strip to trigger Amazon's lazy loading.
+  3. Read every thumbnail img src and clean the URL modifiers.
+  4. Deduplicate the combined list by Amazon asset ID.
+
+This is the minimal, proven approach. The click-per-thumbnail method
+was tried and caused regressions (wrong elements, same URL repeated).
 """
 
 import asyncio
@@ -48,16 +38,16 @@ COLOUR_SELECTORS = [
     "li[id^='color_name_']",
 ]
 
-# Amazon CSS classes that indicate a swatch is unavailable
+# Amazon CSS classes that mark a swatch as unavailable
 DISABLED_SWATCH_CLASSES = ("swatch-disabled", "swatch-out-of-stock", "a-disabled")
 
-# Price text, currency codes, and filler phrases that are not colour names
+# Filler text and price patterns that are not colour names
 NOISE_PATTERN = re.compile(
     r"1\s*option|option\s*from|\bINR\b|\bUSD\b|\bGBP\b|\bEUR\b|^\$|^£|^€",
     re.IGNORECASE,
 )
 
-# Keywords that identify non-photo gallery slots (video, 360, spinners)
+# Keywords that identify non-photo slots (video, 360, spinners)
 SKIP_KEYWORDS = ("play-button", "360_icon", "transparent-pixel", "data:image", "spinner")
 
 
@@ -67,17 +57,17 @@ SKIP_KEYWORDS = ("play-button", "360_icon", "transparent-pixel", "data:image", "
 
 def clean_image_url(url: str) -> str:
     """
-    Remove Amazon's image-dimension and quality modifiers from a URL.
+    Remove Amazon image-dimension and quality modifiers from a URL.
 
-    Amazon appends modifiers between the filename stem and the extension:
-        XXXX._AC_SX679_.jpg   →   XXXX.jpg
-        XXXX._SS40_.jpg       →   XXXX.jpg
-        XXXX._SL1500_.jpg     →   XXXX.jpg
-        XXXX._CR0,0,450,450_.jpg → XXXX.jpg
+    Amazon appends modifiers between the filename stem and extension:
+        XXXX._AC_SX679_.jpg      →  XXXX.jpg
+        XXXX._SS40_.jpg          →  XXXX.jpg
+        XXXX._SL1500_.jpg        →  XXXX.jpg
+        XXXX._CR0,0,450,450_.jpg →  XXXX.jpg
 
-    The regex matches from the first ._ up to (and including) the
-    extension dot, replacing everything with just .extension.
-    Anchored to $ so it only strips the tail of the filename.
+    The pattern matches from the first ._ to the last _. before the
+    extension, anchored to end-of-string so it never touches path
+    segments in the middle of a URL.
     """
     if not url:
         return ""
@@ -91,7 +81,7 @@ def clean_image_url(url: str) -> str:
 
 def image_asset_id(url: str) -> str:
     """
-    Extract the Amazon image hash from a URL for deduplication.
+    Extract the Amazon image hash for deduplication.
 
     Example:
         https://m.media-amazon.com/images/I/61EyBfCXLrL.jpg
@@ -99,7 +89,7 @@ def image_asset_id(url: str) -> str:
 
     Using the asset ID instead of the full URL means the same image
     is recognised as a duplicate even if it appears under different
-    modifier strings.
+    modifier strings in different parts of the page.
     """
     match = re.search(r"/images/I/([A-Za-z0-9+]+)", url)
     return match.group(1) if match else url
@@ -121,15 +111,15 @@ def is_valid_image_url(url: str) -> bool:
 # ─────────────────────────────────────────────────────────────────
 
 def is_noise_label(label: str) -> bool:
-    """Return True if the label contains pricing or filler text, not a colour name."""
+    """Return True if label contains pricing or filler text, not a colour name."""
     return bool(NOISE_PATTERN.search(label))
 
 
 def is_pagination_label(label: str) -> bool:
     """
-    Return True if the label is a bare number like '1', '2' … '99'.
-    These are pagination buttons that Amazon sometimes renders inside
-    the same container as colour swatches.
+    Return True if the label is a bare number like '1' … '99'.
+    Amazon sometimes renders pagination buttons inside the same
+    container as colour swatches.
     """
     return bool(re.fullmatch(r"\d{1,2}", label.strip()))
 
@@ -142,14 +132,12 @@ async def get_colour_name(element) -> str:
     """
     Extract a clean colour name from a swatch <li> element.
 
-    Tries three strategies in order of reliability:
-      1. title / aria-label attribute  (most common on Amazon UK)
-      2. alt text of the swatch image  (image-swatch layouts)
-      3. visible inner text            (text-swatch layouts, last resort)
+    Strategy 1 — title / aria-label attribute  (most common on Amazon UK)
+    Strategy 2 — alt text of the swatch image  (image-swatch layouts)
+    Strategy 3 — visible inner text            (text-swatch layouts, last resort)
 
     Returns an empty string if no usable name is found.
     """
-    # Strategy 1 — attribute
     for attr in ("title", "aria-label"):
         raw = await element.get_attribute(attr)
         if raw:
@@ -157,7 +145,6 @@ async def get_colour_name(element) -> str:
             if value and not is_noise_label(value) and not is_pagination_label(value):
                 return value
 
-    # Strategy 2 — swatch image alt text
     try:
         img = element.locator("img").first
         alt = await img.get_attribute("alt")
@@ -168,7 +155,6 @@ async def get_colour_name(element) -> str:
     except Exception:
         pass
 
-    # Strategy 3 — inner text
     try:
         text = await element.inner_text()
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -196,10 +182,9 @@ async def is_swatch_disabled(element) -> bool:
 async def wait_for_gallery_update(page, old_src: str) -> None:
     """
     Wait until the main product image actually changes after a swatch click.
-
-    Comparing the new src against old_src is more reliable than waiting
-    for a selector that was already visible from the previous colour.
-    Falls back to a short fixed delay if the JS function times out.
+    Compares against old_src so the wait does not return immediately when
+    the gallery was already visible from the previous colour selection.
+    Falls back to a fixed delay if the JS condition times out.
     """
     try:
         escaped = old_src.replace("'", "\\'")
@@ -208,7 +193,6 @@ async def wait_for_gallery_update(page, old_src: str) -> None:
             timeout=5000,
         )
     except Exception:
-        # Fallback: give JS a moment to swap image sources
         await page.wait_for_timeout(800)
 
 
@@ -216,161 +200,92 @@ async def scroll_thumbnail_strip(page) -> None:
     """
     Scroll the thumbnail strip to force Amazon to lazy-load all thumbnails.
 
-    Amazon only populates thumbnail src attributes when the element is
-    scrolled into the viewport. Without this step, the last 1-2 thumbnails
-    remain empty and are missed — producing 7 images instead of 8.
+    Amazon only populates thumbnail src attributes when the element enters
+    the viewport. Without this, the last 1–2 thumbnails remain empty —
+    causing 7 images to be collected instead of 8.
     """
     try:
         strip = page.locator("div#altImages")
         if await strip.count() == 0:
             return
-        # Scroll down in small steps to trigger lazy loading of every item
         for _ in range(8):
             await strip.evaluate("el => el.scrollTop += 150")
             await page.wait_for_timeout(100)
-        # Reset scroll position so subsequent reads start from the top
+        # Reset so subsequent reads start from the top
         await strip.evaluate("el => el.scrollTop = 0")
         await page.wait_for_timeout(200)
     except Exception:
         pass
 
 
-async def get_main_image_url(page) -> str:
+async def collect_images_for_current_colour(page) -> list:
     """
-    Read the highest-resolution URL currently displayed in the main viewer.
+    Collect all unique high-resolution image URLs for the currently
+    selected colour variant.
 
-    Method 1 — data-a-dynamic-image:
-        Amazon stores a JSON dict { url: [width, height] } on img#landingImage.
-        We pick the URL with the largest width and clean any modifiers.
+    Two-source strategy:
+      Source A — data-a-dynamic-image on img#landingImage:
+          Amazon stores { url: [width, height] } JSON here.
+          We pick the URL with the largest width. This is the
+          hero/main image at true full resolution.
+          clean_image_url() is applied to remove any modifiers.
 
-    Method 2 — plain src fallback:
-        Used when the data attribute is absent (some older page layouts).
-    """
-    # Method 1: JSON data attribute
-    try:
-        data_attr = await page.locator("img#landingImage").get_attribute(
-            "data-a-dynamic-image", timeout=2000
-        )
-        if data_attr:
-            url_map = json.loads(data_attr)
-            if url_map:
-                best_url = max(url_map, key=lambda u: url_map[u][0])
-                # FIX: clean the URL — data-a-dynamic-image can contain modifiers
-                cleaned = clean_image_url(best_url)
-                if is_valid_image_url(cleaned):
-                    return cleaned
-    except Exception:
-        pass
+      Source B — thumbnail strip (div#altImages):
+          After scrolling to trigger lazy loading, we read every
+          thumbnail img src and clean modifier strings.
+          This gives the remaining 6–7 angle/detail images.
 
-    # Method 2: plain src
-    try:
-        src = await page.locator("img#landingImage").get_attribute("src", timeout=2000)
-        cleaned = clean_image_url(src or "")
-        if is_valid_image_url(cleaned):
-            return cleaned
-    except Exception:
-        pass
-
-    return ""
-
-
-async def collect_all_images_by_clicking_thumbnails(page) -> list:
-    """
-    Collect one high-resolution image URL per gallery thumbnail.
-
-    Why click-through instead of reading src directly:
-      - Amazon lazy-loads thumbnail src — empty until scrolled into view
-      - data-a-dynamic-image only reflects the currently displayed image
-      - Reading thumbnail src directly gives low-res cropped images
-
-    Process:
-      1. Scroll the thumbnail strip to trigger lazy loading of all items
-      2. Locate every thumbnail list item
-      3. Skip non-photo slots (video, 360-view)
-      4. Click each thumbnail — this updates the main image viewer
-      5. Read the high-res URL from data-a-dynamic-image on the main viewer
-      6. Deduplicate by Amazon asset ID (not full URL) to prevent duplicates
-         caused by the same image appearing under different modifier strings
-
-    Falls back to reading src attributes directly if click-through yields
-    no results (network-blocked or unusual page layout).
+    Deduplication is done by Amazon asset ID (the image hash in the
+    URL path) not the full URL. This prevents the same image appearing
+    twice when it exists under different modifier strings across
+    Source A and Source B.
     """
     all_urls = []
     seen_ids = set()
 
-    # Step 1: trigger lazy loading
+    def add_url(url: str) -> None:
+        """Clean, validate, deduplicate, and append a URL."""
+        cleaned = clean_image_url(url)
+        if not is_valid_image_url(cleaned):
+            return
+        asset_id = image_asset_id(cleaned)
+        if not asset_id or asset_id in seen_ids:
+            return
+        seen_ids.add(asset_id)
+        all_urls.append(cleaned)
+
+    # ── Source A: hero image from data-a-dynamic-image ──────────
+    try:
+        data_attr = await page.locator("img#landingImage").get_attribute(
+            "data-a-dynamic-image", timeout=3000
+        )
+        if data_attr:
+            url_map = json.loads(data_attr)
+            if url_map:
+                # Pick the URL with the largest width
+                best_url = max(url_map, key=lambda u: url_map[u][0])
+                add_url(best_url)
+    except Exception:
+        pass
+
+    # ── Scroll to trigger lazy loading before reading thumbnails ─
     await scroll_thumbnail_strip(page)
 
-    # Step 2: locate thumbnails
-    thumb_locator = page.locator(
-        "li.imageThumbnail, div#altImages ul li.item"
-    )
-    count = await thumb_locator.count()
+    # ── Source B: thumbnail strip ────────────────────────────────
+    # Primary selector — matches the standard Amazon thumbnail layout
+    thumbnails = await page.locator(
+        "li.imageThumbnail img, div#altImages ul li img"
+    ).all()
 
-    if count == 0:
-        # Wider fallback selector
-        thumb_locator = page.locator("div#altImages ul li")
-        count = await thumb_locator.count()
+    # Fallback if primary finds nothing
+    if not thumbnails:
+        thumbnails = await page.locator("div#altImages img").all()
 
-    if count == 0:
-        return []
-
-    print(f"    Found {count} thumbnail slot(s) in gallery strip.")
-
-    for i in range(count):
-        thumb = thumb_locator.nth(i)
-
-        # Step 3: skip non-photo slots
-        try:
-            class_attr = (await thumb.get_attribute("class")) or ""
-            if "videoThumbnail" in class_attr or "360" in class_attr:
-                continue
-        except Exception:
-            continue
-
-        # Step 4: click the thumbnail
-        try:
-            await thumb.scroll_into_view_if_needed()
-            await thumb.click(force=True)
-            # Short wait for the main viewer to update its src
-            await page.wait_for_timeout(350)
-        except Exception:
-            continue
-
-        # Step 5: read high-res URL from main viewer
-        url = await get_main_image_url(page)
-        if not url:
-            continue
-
-        # Step 6: deduplicate by asset ID
-        asset_id = image_asset_id(url)
-        if not asset_id or asset_id in seen_ids:
-            continue
-
-        seen_ids.add(asset_id)
-        all_urls.append(url)
-
-    # Fallback if click-through yielded nothing
-    if not all_urls:
-        print("    Warning: click-through yielded nothing — falling back to src scraping.")
-        thumbnails = await page.locator(
-            "li.imageThumbnail img, div#altImages ul li img"
-        ).all()
-        if not thumbnails:
-            thumbnails = await page.locator("div#altImages img").all()
-
-        seen_ids_fb = set()
-        for img in thumbnails:
-            src = await img.get_attribute("src") or await img.get_attribute("data-src")
-            if not src:
-                continue
-            cleaned = clean_image_url(src)
-            if not is_valid_image_url(cleaned):
-                continue
-            aid = image_asset_id(cleaned)
-            if aid and aid not in seen_ids_fb:
-                seen_ids_fb.add(aid)
-                all_urls.append(cleaned)
+    for img in thumbnails:
+        # Prefer data-src for lazy-loaded images, fall back to src
+        src = await img.get_attribute("src") or await img.get_attribute("data-src")
+        if src:
+            add_url(src)
 
     return all_urls
 
@@ -382,7 +297,7 @@ async def collect_all_images_by_clicking_thumbnails(page) -> list:
 def print_results(results: dict) -> None:
     """
     Print a readable colour-by-colour summary for manual cross-checking.
-    Flags any URL where a modifier may not have been stripped correctly.
+    Flags any URL where a modifier may not have been stripped.
     """
     print("\n" + "=" * 65)
     print("  SCRAPE RESULTS")
@@ -396,7 +311,6 @@ def print_results(results: dict) -> None:
         print(f"\n  Colour : {colour}")
         print(f"  Images : {len(images)}")
         for i, url in enumerate(images, start=1):
-            # Flag residual modifiers so they are visible during review
             flag = "  ⚠️  modifier may remain" if "._" in url and "_." in url else ""
             print(f"    {i}. {url}{flag}")
         if not images:
@@ -418,21 +332,21 @@ async def scrape_amazon_images(url: str) -> dict:
     from an Amazon UK product page.
 
     Flow:
-      1.  Open the page (guard against None response and non-200 status)
-      2a. Detect CAPTCHA
+      1.  Open the page
+      2a. Detect CAPTCHA and soft-block pages
       2b. Dismiss cookie consent banner if present
       3a. Wait for product title (confirms JS has rendered)
       3b. Wait for image gallery
-      4.  Detect colour swatches using ordered selector list
-      5.  For each available colour:
-          a. Click the swatch
-          b. Wait for main image to update (not just any visible image)
-          c. Scroll thumbnail strip to trigger lazy loading
-          d. Click each thumbnail and capture high-res URL
+      4.  Detect colour swatches
+      5.  For each available (non-disabled) colour:
+          a. Capture current main image src (for change detection)
+          b. Click the swatch
+          c. Wait for main image src to change
+          d. Collect hero image + all thumbnail images
       6.  Return { colour_name: [image_url, ...] }
 
-    Returns an empty dict on any unrecoverable error.
     Browser is always closed via try/finally — no resource leaks.
+    Returns an empty dict on any unrecoverable error.
     """
     results = {}
 
@@ -445,35 +359,30 @@ async def scrape_amazon_images(url: str) -> dict:
         page = await context.new_page()
 
         try:
-            # ── 1. Load the page ──────────────────────────────────────
+            # ── 1. Load the page ──────────────────────────────────
             print(f"\nOpening: {url}")
             try:
                 response = await page.goto(url, wait_until="load", timeout=60000)
-
-                # Playwright returns None on certain navigation failures
                 if response is None or response.status != 200:
                     status = response.status if response else "None"
                     print(f"Error: HTTP {status} — Amazon may be blocking this request.")
                     return {}
-
             except Exception as e:
                 print(f"Error: Could not load page — {e}")
                 return {}
 
-            # ── 2a. CAPTCHA detection ─────────────────────────────────
-            captcha_in_url = "captcha" in page.url.lower()
-            captcha_on_page = await page.locator("input#captchacharacters").count() > 0
-            if captcha_in_url or captcha_on_page:
+            # ── 2a. CAPTCHA and soft-block detection ──────────────
+            if "captcha" in page.url.lower() or \
+               await page.locator("input#captchacharacters").count() > 0:
                 print("Error: Amazon showed a CAPTCHA.")
                 print("Tip: Set headless=False, solve manually, then re-run.")
                 return {}
 
-            # Soft-block: Amazon sometimes returns 200 but shows a bot-detection page
             if await page.locator("div#noResultsTitle").count() > 0:
                 print("Error: Amazon returned a soft-block page.")
                 return {}
 
-            # ── 2b. Cookie consent ────────────────────────────────────
+            # ── 2b. Cookie consent banner ─────────────────────────
             try:
                 btn = page.locator("input#sp-cc-accept")
                 if await btn.is_visible(timeout=2000):
@@ -482,26 +391,25 @@ async def scrape_amazon_images(url: str) -> dict:
             except Exception:
                 pass
 
-            # ── 3a. Wait for product title ────────────────────────────
+            # ── 3a. Wait for product title ────────────────────────
             try:
                 await page.wait_for_selector("#productTitle", timeout=10000)
             except Exception:
                 print("Warning: Product title not found — page may not have fully rendered.")
 
-            # ── 3b. Wait for image gallery ────────────────────────────
+            # ── 3b. Wait for image gallery ────────────────────────
             try:
                 await page.wait_for_selector("div#altImages", timeout=10000)
             except Exception:
                 print("Warning: Image gallery (div#altImages) not found.")
 
-            # ── Product title ─────────────────────────────────────────
             try:
                 title = await page.locator("#productTitle").inner_text(timeout=5000)
                 print(f"Product: {title.strip()}")
             except Exception:
                 print("Product title not found.")
 
-            # ── 4. Detect colour swatches ─────────────────────────────
+            # ── 4. Detect colour swatches ─────────────────────────
             colour_elements = []
             matched_selector = None
 
@@ -513,13 +421,12 @@ async def scrape_amazon_images(url: str) -> dict:
                     print(f"Found {len(elements)} swatch(es) via: '{selector}'")
                     break
 
-            # ── 5. Process each colour ────────────────────────────────
+            # ── 5. Process each colour ────────────────────────────
             if colour_elements and matched_selector:
                 seen_names = set()
-                total = len(colour_elements)
 
-                for index in range(total):
-                    # Re-query by index using the matched selector for DOM stability
+                for index in range(len(colour_elements)):
+                    # Re-query by index for DOM stability after each click
                     element = page.locator(matched_selector).nth(index)
 
                     if await is_swatch_disabled(element):
@@ -538,35 +445,32 @@ async def scrape_amazon_images(url: str) -> dict:
                     seen_names.add(colour_name)
                     print(f"\nProcessing: {colour_name} ...")
 
-                    # Capture current main image src before clicking
+                    # Capture current src before clicking for change detection
                     old_src = (
                         await page.locator("img#landingImage").get_attribute("src")
                     ) or ""
 
-                    # Click the swatch
                     try:
                         await element.click(force=True)
                     except Exception as e:
                         print(f"  Warning: Could not click swatch — {e}")
                         continue
 
-                    # Wait for main image to actually change (not just be visible)
+                    # Wait until the main image actually changes
                     await wait_for_gallery_update(page, old_src)
 
-                    # Collect all images for this colour
-                    images = await collect_all_images_by_clicking_thumbnails(page)
+                    images = await collect_images_for_current_colour(page)
                     results[colour_name] = images
                     print(f"  → Collected {len(images)} image(s)")
 
             else:
-                # No colour variants — scrape the default view
                 print("No colour variants detected. Extracting default images...")
-                images = await collect_all_images_by_clicking_thumbnails(page)
+                images = await collect_images_for_current_colour(page)
                 results["Default"] = images
                 print(f"  → Collected {len(images)} image(s)")
 
         finally:
-            # Always close the browser — even if an unexpected exception occurs
+            # Guaranteed cleanup — runs even if an exception is raised
             await browser.close()
 
     return results
@@ -582,10 +486,8 @@ if __name__ == "__main__":
     print("Starting Amazon Image Scraper...")
     data = asyncio.run(scrape_amazon_images(TEST_URL))
 
-    # Print human-readable results for manual cross-checking
     print_results(data)
 
-    # Save full data to JSON
     output_file = "scraped_images.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

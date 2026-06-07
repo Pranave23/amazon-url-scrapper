@@ -1,8 +1,8 @@
 """
-amazon_scraper_final.py
+amazon_scraper.py
 =======================
 Scrapes all colour variants and their high-resolution image URLs
-from an Amazon UK product page.
+from an Amazon product page.
 
 Approach for image collection (intentionally simple):
   1. After clicking a colour swatch, read data-a-dynamic-image on
@@ -16,14 +16,13 @@ was tried and caused regressions (wrong elements, same URL repeated).
 """
 
 import asyncio
+import ast
 import json
 import re
 from playwright.async_api import async_playwright
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────────
 
+#tells the user which browser is being used
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -65,14 +64,13 @@ def clean_image_url(url: str) -> str:
         XXXX._SL1500_.jpg        →  XXXX.jpg
         XXXX._CR0,0,450,450_.jpg →  XXXX.jpg
 
-    The pattern matches from the first ._ to the last _. before the
-    extension, anchored to end-of-string so it never touches path
-    segments in the middle of a URL.
+    This greedily matches from the first ._ to the last _. before the
+    extension to completely remove chained modifiers.
     """
     if not url:
         return ""
     return re.sub(
-        r"\._[^.]+\.(jpg|jpeg|png|gif|webp)$",
+        r"\._.*\.(jpg|jpeg|png|gif|webp)$",
         r".\1",
         url,
         flags=re.IGNORECASE,
@@ -91,7 +89,7 @@ def image_asset_id(url: str) -> str:
     is recognised as a duplicate even if it appears under different
     modifier strings in different parts of the page.
     """
-    match = re.search(r"/images/I/([A-Za-z0-9+]+)", url)
+    match = re.search(r"/images/I/([^/.]+)", url)
     return match.group(1) if match else url
 
 
@@ -104,6 +102,54 @@ def is_valid_image_url(url: str) -> bool:
     if any(kw in url for kw in SKIP_KEYWORDS):
         return False
     return url.startswith("http")
+
+
+def extract_color_images(html_content: str) -> dict:
+    """
+    Extract the colorImages JSON block from HTML script tags.
+    Returns a dict mapping color names to list of image dictionaries,
+    or None if not found.
+    """
+    for match in re.finditer(r"colorImages", html_content):
+        start_idx = match.start()
+        brace_start = html_content.find("{", start_idx)
+        if brace_start == -1 or brace_start - start_idx > 50:
+            continue
+            
+        brace_count = 0
+        in_string = False
+        escape = False
+        for i in range(brace_start, len(html_content)):
+            char = html_content[i]
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"' and not escape:
+                in_string = not in_string
+                continue
+            if not in_string:
+                if char == "{":
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_str = html_content[brace_start:i+1]
+                        # Convert JavaScript literals to Python compatible representation
+                        json_str_py = json_str.replace("true", "True").replace("false", "False").replace("null", "None")
+                        try:
+                            data = ast.literal_eval(json_str_py)
+                            if isinstance(data, dict) and len(data) > 0:
+                                return data
+                        except Exception:
+                            try:
+                                return json.loads(json_str)
+                            except Exception:
+                                pass
+                        break
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -182,64 +228,47 @@ async def is_swatch_disabled(element) -> bool:
 async def wait_for_gallery_update(page, old_src: str) -> None:
     """
     Wait until the main product image actually changes after a swatch click.
-    Compares against old_src so the wait does not return immediately when
-    the gallery was already visible from the previous colour selection.
-    Falls back to a fixed delay if the JS condition times out.
+    Compares against old_src and supports multiple common landing image IDs.
     """
     try:
         escaped = old_src.replace("'", "\\'")
         await page.wait_for_function(
-            f"(document.querySelector('img#landingImage')?.src || '') !== '{escaped}'",
+            f"""
+            (() => {{
+                const img = document.querySelector('img#landingImage, img#imgBlkFront, img#main-image');
+                return (img ? img.src : '') !== '{escaped}';
+            }})()
+            """,
             timeout=5000,
         )
     except Exception:
         await page.wait_for_timeout(800)
 
 
-async def scroll_thumbnail_strip(page) -> None:
+async def collect_images_for_current_colour(page) -> list:
     """
-    Scroll the thumbnail strip to force Amazon to lazy-load all thumbnails.
-
-    Amazon only populates thumbnail src attributes when the element enters
-    the viewport. Without this, the last 1–2 thumbnails remain empty —
-    causing 7 images to be collected instead of 8.
+    Collect all unique high-resolution image URLs for the currently
+    selected colour variant (DOM fallback).
     """
+    # Inject CSS to hide all popovers and overlays so they cannot intercept clicks
     try:
-        strip = page.locator("div#altImages")
-        if await strip.count() == 0:
-            return
-        for _ in range(8):
-            await strip.evaluate("el => el.scrollTop += 150")
-            await page.wait_for_timeout(100)
-        # Reset so subsequent reads start from the top
-        await strip.evaluate("el => el.scrollTop = 0")
+        await page.add_style_tag(content="""
+            .a-popover-container, 
+            .a-popover-modal, 
+            .a-modal-scroller, 
+            #a-popover-lgtbox, 
+            #a-page-overlay, 
+            [class*="popover"],
+            [class*="modal"] {
+                display: none !important;
+                pointer-events: none !important;
+                z-index: -9999 !important;
+            }
+        """)
         await page.wait_for_timeout(200)
     except Exception:
         pass
 
-
-async def collect_images_for_current_colour(page) -> list:
-    """
-    Collect all unique high-resolution image URLs for the currently
-    selected colour variant.
-
-    Two-source strategy:
-      Source A — data-a-dynamic-image on img#landingImage:
-          Amazon stores { url: [width, height] } JSON here.
-          We pick the URL with the largest width. This is the
-          hero/main image at true full resolution.
-          clean_image_url() is applied to remove any modifiers.
-
-      Source B — thumbnail strip (div#altImages):
-          After scrolling to trigger lazy loading, we read every
-          thumbnail img src and clean modifier strings.
-          This gives the remaining 6–7 angle/detail images.
-
-    Deduplication is done by Amazon asset ID (the image hash in the
-    URL path) not the full URL. This prevents the same image appearing
-    twice when it exists under different modifier strings across
-    Source A and Source B.
-    """
     all_urls = []
     seen_ids = set()
 
@@ -256,9 +285,8 @@ async def collect_images_for_current_colour(page) -> list:
 
     # ── Source A: hero image from data-a-dynamic-image ──────────
     try:
-        data_attr = await page.locator("img#landingImage").get_attribute(
-            "data-a-dynamic-image", timeout=3000
-        )
+        landing = page.locator("img#landingImage, img#imgBlkFront, img#main-image, div#img-wrapper img").first
+        data_attr = await landing.get_attribute("data-a-dynamic-image")
         if data_attr:
             url_map = json.loads(data_attr)
             if url_map:
@@ -268,22 +296,38 @@ async def collect_images_for_current_colour(page) -> list:
     except Exception:
         pass
 
-    # ── Scroll to trigger lazy loading before reading thumbnails ─
-    await scroll_thumbnail_strip(page)
-
     # ── Source B: thumbnail strip ────────────────────────────────
-    # Primary selector — matches the standard Amazon thumbnail layout
     thumbnails = await page.locator(
-        "li.imageThumbnail img, div#altImages ul li img"
+        """
+    li.imageThumbnail img,
+    div#altImages img,
+    #imageBlockThumbs img,
+    span.a-button-thumbnail img
+    """
     ).all()
 
-    # Fallback if primary finds nothing
     if not thumbnails:
         thumbnails = await page.locator("div#altImages img").all()
 
     for img in thumbnails:
-        # Prefer data-src for lazy-loaded images, fall back to src
-        src = await img.get_attribute("src") or await img.get_attribute("data-src")
+        # Scroll the thumbnail into view
+        try:
+            await img.scroll_into_view_if_needed(timeout=1000)
+        except Exception:
+            pass
+
+        # Poll up to 1 second for thumbnail to load a valid source URL
+        src = None
+        for _ in range(10):
+            for attr in ("data-a-hires", "data-src", "src"):
+                val = await img.get_attribute(attr)
+                if val and not any(kw in val for kw in SKIP_KEYWORDS) and val.startswith("http"):
+                    src = val
+                    break
+            if src:
+                break
+            await page.wait_for_timeout(100)
+
         if src:
             add_url(src)
 
@@ -329,25 +373,13 @@ def print_results(results: dict) -> None:
 async def scrape_amazon_images(url: str) -> dict:
     """
     Scrape all colour variants and their high-resolution image URLs
-    from an Amazon UK product page.
-
-    Flow:
-      1.  Open the page
-      2a. Detect CAPTCHA and soft-block pages
-      2b. Dismiss cookie consent banner if present
-      3a. Wait for product title (confirms JS has rendered)
-      3b. Wait for image gallery
-      4.  Detect colour swatches
-      5.  For each available (non-disabled) colour:
-          a. Capture current main image src (for change detection)
-          b. Click the swatch
-          c. Wait for main image src to change
-          d. Collect hero image + all thumbnail images
-      6.  Return { colour_name: [image_url, ...] }
-
-    Browser is always closed via try/finally — no resource leaks.
-    Returns an empty dict on any unrecoverable error.
+    from an Amazon product page. Uses script-based parsing primarily
+    and a robust DOM-based fallback.
     """
+    from urllib.parse import urlparse
+    parsed_url = urlparse(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    
     results = {}
 
     async with async_playwright() as p:
@@ -391,86 +423,130 @@ async def scrape_amazon_images(url: str) -> dict:
             except Exception:
                 pass
 
-            # ── 3a. Wait for product title ────────────────────────
+            # ── 3. Wait for product title ────────────────────────
             try:
                 await page.wait_for_selector("#productTitle", timeout=10000)
-            except Exception:
-                print("Warning: Product title not found — page may not have fully rendered.")
-
-            # ── 3b. Wait for image gallery ────────────────────────
-            try:
-                await page.wait_for_selector("div#altImages", timeout=10000)
-            except Exception:
-                print("Warning: Image gallery (div#altImages) not found.")
-
-            try:
                 title = await page.locator("#productTitle").inner_text(timeout=5000)
                 print(f"Product: {title.strip()}")
             except Exception:
-                print("Product title not found.")
+                print("Warning: Product title not found — page may not have fully rendered.")
 
-            # ── 4. Detect colour swatches ─────────────────────────
-            colour_elements = []
+            # ── 4. Try Script-Based Parsing (Primary Strategy) ────
+            print("Extracting configuration scripts...")
+            html = await page.content()
+            color_images = extract_color_images(html)
+
+            # Detect colour swatches from DOM to get ASINs
+            swatches = []
             matched_selector = None
-
             for selector in COLOUR_SELECTORS:
                 elements = await page.locator(selector).all()
                 if elements:
-                    colour_elements = elements
                     matched_selector = selector
-                    print(f"Found {len(elements)} swatch(es) via: '{selector}'")
+                    for el in elements:
+                        if await is_swatch_disabled(el):
+                            continue
+                        asin = await el.get_attribute("data-asin") or await el.get_attribute("data-csa-c-item-id")
+                        color_name = await get_colour_name(el)
+                        if color_name and is_pagination_label(color_name):
+                            continue
+                        if asin and color_name:
+                            swatches.append({"color": color_name, "asin": asin})
                     break
 
-            # ── 5. Process each colour ────────────────────────────
-            if colour_elements and matched_selector:
-                seen_names = set()
+            if color_images:
+                print("Successfully parsed colorImages config block.")
+                
+                # Check for direct variant mappings in the initial page config
+                for color, imgs in color_images.items():
+                    if color != 'initial':
+                        results[color] = [clean_image_url(x.get('hiRes') or x.get('large') or x.get('thumb') or '') for x in imgs]
+                
+                # Resolve the 'initial' color
+                selected_color = None
+                try:
+                    selected_el = page.locator("div#variation_color_name span.selection, div#inline-twister-row-color_name span.selection").first
+                    if await selected_el.count() > 0:
+                        selected_color = (await selected_el.inner_text()).strip()
+                except Exception:
+                    pass
+                    
+                if not selected_color and swatches:
+                    selected_color = swatches[0]["color"]
+                elif not selected_color:
+                    selected_color = "Default"
+                    
+                results[selected_color] = [clean_image_url(x.get('hiRes') or x.get('large') or x.get('thumb') or '') for x in color_images.get('initial', [])]
+                
+                # For any swatches not yet in results, navigate to their ASIN page
+                for swatch in swatches:
+                    color = swatch["color"]
+                    asin = swatch["asin"]
+                    if color not in results:
+                        print(f"Loading page for variant '{color}' (ASIN: {asin})...")
+                        swatch_url = f"{base_url}/dp/{asin}/"
+                        try:
+                            await page.goto(swatch_url, wait_until="load", timeout=30000)
+                            swatch_html = await page.content()
+                            swatch_color_images = extract_color_images(swatch_html)
+                            if swatch_color_images and 'initial' in swatch_color_images:
+                                results[color] = [clean_image_url(x.get('hiRes') or x.get('large') or x.get('thumb') or '') for x in swatch_color_images['initial']]
+                                print(f"  -> Extracted {len(results[color])} images.")
+                            else:
+                                print(f"  -> Failed to find images for variant '{color}'.")
+                        except Exception as e:
+                            print(f"  -> Error loading swatch page: {e}")
 
-                for index in range(len(colour_elements)):
-                    # Re-query by index for DOM stability after each click
-                    element = page.locator(matched_selector).nth(index)
+            # ── 5. Fallback DOM-based Scraping ────────────────────
+            if not results:
+                print("Script-based parsing failed or returned no data. Falling back to DOM-based crawler...")
+                if swatches and matched_selector:
+                    seen_names = set()
+                    for index in range(len(swatches)):
+                        element = page.locator(matched_selector).nth(index)
+                        if await is_swatch_disabled(element):
+                            continue
+                        colour_name = await get_colour_name(element)
+                        if not colour_name or is_pagination_label(colour_name) or colour_name in seen_names:
+                            continue
 
-                    if await is_swatch_disabled(element):
-                        continue
+                        seen_names.add(colour_name)
+                        print(f"\nProcessing swatch: {colour_name} ...")
 
-                    colour_name = await get_colour_name(element)
+                        # Capture current main image src before click for change detection
+                        old_src = ""
+                        try:
+                            landing = page.locator("img#landingImage, img#imgBlkFront, img#main-image").first
+                            old_src = await landing.get_attribute("src") or ""
+                        except Exception:
+                            pass
 
-                    if not colour_name:
-                        continue
-                    if is_pagination_label(colour_name):
-                        print(f"  Skipping pagination label: '{colour_name}'")
-                        continue
-                    if colour_name in seen_names:
-                        continue
+                        try:
+                            # Scroll the swatch into view and click
+                            await element.scroll_into_view_if_needed()
+                            await element.click(force=True)
+                        except Exception as e:
+                            print(f"  Warning: Could not click swatch — {e}")
+                            continue
 
-                    seen_names.add(colour_name)
-                    print(f"\nProcessing: {colour_name} ...")
+                        # Wait for main image to change
+                        await wait_for_gallery_update(page, old_src)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=3000)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(1000)
 
-                    # Capture current src before clicking for change detection
-                    old_src = (
-                        await page.locator("img#landingImage").get_attribute("src")
-                    ) or ""
-
-                    try:
-                        await element.click(force=True)
-                    except Exception as e:
-                        print(f"  Warning: Could not click swatch — {e}")
-                        continue
-
-                    # Wait until the main image actually changes
-                    await wait_for_gallery_update(page, old_src)
-
+                        images = await collect_images_for_current_colour(page)
+                        results[colour_name] = images
+                        print(f"  → Collected {len(images)} image(s)")
+                else:
+                    print("No colour variants detected. Extracting default images from DOM...")
                     images = await collect_images_for_current_colour(page)
-                    results[colour_name] = images
+                    results["Default"] = images
                     print(f"  → Collected {len(images)} image(s)")
 
-            else:
-                print("No colour variants detected. Extracting default images...")
-                images = await collect_images_for_current_colour(page)
-                results["Default"] = images
-                print(f"  → Collected {len(images)} image(s)")
-
         finally:
-            # Guaranteed cleanup — runs even if an exception is raised
             await browser.close()
 
     return results
@@ -481,7 +557,7 @@ async def scrape_amazon_images(url: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    TEST_URL = "https://www.amazon.co.uk/dp/B0D8THGP6G"
+    TEST_URL = "https://www.amazon.co.uk/dp/B0D8THGP6G?th=1"
 
     print("Starting Amazon Image Scraper...")
     data = asyncio.run(scrape_amazon_images(TEST_URL))

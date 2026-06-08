@@ -328,177 +328,34 @@ if st.session_state["scraped_data"] is not None:
 # EXCEL FILLER SECTION
 # ─────────────────────────────────────────────────────────────────
 
-try:
-    # pyrefly: ignore [missing-import]
-    from lxml import etree as LXML_ET
-    LXML_AVAILABLE = True
-except ImportError:
-    import xml.etree.ElementTree as STD_ET
-    LXML_AVAILABLE = False
-
-def col_to_letter(col_num):
-    """Convert 1-based column number to Excel column letter(s)."""
-    result = ''
-    while col_num > 0:
-        col_num, remainder = divmod(col_num - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
-
 def fill_excel_preserve_formatting(original_bytes, cell_updates):
     """
-    Modify specific cells in the Template sheet of an xlsx file
-    while preserving ALL formatting, data validations, dropdowns,
-    conditional formatting, and other Excel features.
-    
-    Works by directly editing the XML inside the xlsx ZIP archive,
-    only touching the cells that need updating and leaving
-    everything else byte-identical.
-    
-    cell_updates: dict mapping (row, col) tuples to string values.
-                  Row and col are 1-indexed.
+    Modify specific cells in the Template sheet of an xlsx file using openpyxl.
+    This is simple and standard, but note that advanced Excel features like 
+    dropdowns/data validations may be removed by openpyxl when saving.
     """
-    MAIN_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-    
     input_buffer = io.BytesIO(original_bytes)
+    wb = openpyxl.load_workbook(input_buffer)
     
-    with zipfile.ZipFile(input_buffer, 'r') as zin:
-        # 1. Find the Template sheet's XML file path
-        wb_xml = zin.read('xl/workbook.xml')
-        
-        if LXML_AVAILABLE:
-            wb_root = LXML_ET.fromstring(wb_xml)
-        else:
-            # Standard ElementTree namespace registration
-            wb_xml_str = wb_xml.decode('utf-8')
-            ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', wb_xml_str)
-            for prefix, uri in ns_pairs:
-                STD_ET.register_namespace(prefix if prefix else '', uri)
-            wb_root = STD_ET.fromstring(wb_xml)
-        
-        # Find the Template sheet's relationship ID
-        template_rid = None
-        sheets_elem = wb_root.find(f'{{{MAIN_NS}}}sheets')
-        if sheets_elem is not None:
-            for sheet in sheets_elem.findall(f'{{{MAIN_NS}}}sheet'):
-                name = sheet.get('name', '')
-                if 'template' in name.lower():
-                    template_rid = sheet.get(f'{{{REL_NS}}}id')
-                    break
-        
-        if not template_rid:
-            raise ValueError("Template sheet not found in workbook")
-        
-        # Read workbook rels to find the actual sheet file path
-        rels_xml = zin.read('xl/_rels/workbook.xml.rels')
-        if LXML_AVAILABLE:
-            rels_root = LXML_ET.fromstring(rels_xml)
-        else:
-            rels_root = STD_ET.fromstring(rels_xml)
-        
-        sheet_target = None
-        for rel in rels_root:
-            if rel.get('Id') == template_rid:
-                sheet_target = rel.get('Target')
-                break
-        
-        if not sheet_target:
-            raise ValueError("Template sheet relationship not found")
-        
-        # Normalise the path
-        sheet_path = 'xl/' + sheet_target if not sheet_target.startswith('xl/') else sheet_target
-        
-        # 2. Read and parse the sheet XML
-        sheet_xml_bytes = zin.read(sheet_path)
-        
-        if LXML_AVAILABLE:
-            # Use lxml parser to preserve all formatting and spaces
-            parser = LXML_ET.XMLParser(remove_blank_text=False)
-            sheet_root = LXML_ET.fromstring(sheet_xml_bytes, parser=parser)
-        else:
-            sheet_xml_str = sheet_xml_bytes.decode('utf-8')
-            sheet_ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', sheet_xml_str)
-            for prefix, uri in sheet_ns_pairs:
-                STD_ET.register_namespace(prefix if prefix else '', uri)
-            sheet_root = STD_ET.fromstring(sheet_xml_bytes)
-        
-        # 3. Find <sheetData> and modify cells
-        sheet_data = sheet_root.find(f'{{{MAIN_NS}}}sheetData')
-        if sheet_data is None:
-            raise ValueError("sheetData not found in Template sheet")
-        
-        # Build a lookup of existing row elements by row number
-        row_elements = {}
-        for row_elem in sheet_data.findall(f'{{{MAIN_NS}}}row'):
-            r = int(row_elem.get('r'))
-            row_elements[r] = row_elem
-        
-        # Apply each cell update
-        for (row, col), value in cell_updates.items():
-            cell_ref = f"{col_to_letter(col)}{row}"
+    # Find the Template sheet
+    template_sheet = None
+    for name in wb.sheetnames:
+        if "template" in name.lower():
+            template_sheet = wb[name]
+            break
             
-            # Find or create the row element
-            if row not in row_elements:
-                if LXML_AVAILABLE:
-                    row_elem = LXML_ET.SubElement(sheet_data, f'{{{MAIN_NS}}}row')
-                else:
-                    row_elem = STD_ET.SubElement(sheet_data, f'{{{MAIN_NS}}}row')
-                row_elem.set('r', str(row))
-                row_elements[row] = row_elem
-            else:
-                row_elem = row_elements[row]
-            
-            # Find existing cell element or create a new one
-            cell_elem = None
-            for c in row_elem.findall(f'{{{MAIN_NS}}}c'):
-                if c.get('r') == cell_ref:
-                    cell_elem = c
-                    break
-            
-            if cell_elem is None:
-                if LXML_AVAILABLE:
-                    cell_elem = LXML_ET.SubElement(row_elem, f'{{{MAIN_NS}}}c')
-                else:
-                    cell_elem = STD_ET.SubElement(row_elem, f'{{{MAIN_NS}}}c')
-                cell_elem.set('r', cell_ref)
-            
-            # Clear existing content (value, formula, etc.)
-            for child in list(cell_elem):
-                cell_elem.remove(child)
-            
-            # Remove old type attribute if present
-            if 't' in cell_elem.attrib:
-                del cell_elem.attrib['t']
-            
-            # Set as inline string (avoids modifying sharedStrings.xml)
-            cell_elem.set('t', 'inlineStr')
-            if LXML_AVAILABLE:
-                is_elem = LXML_ET.SubElement(cell_elem, f'{{{MAIN_NS}}}is')
-                t_elem = LXML_ET.SubElement(is_elem, f'{{{MAIN_NS}}}t')
-            else:
-                is_elem = STD_ET.SubElement(cell_elem, f'{{{MAIN_NS}}}is')
-                t_elem = STD_ET.SubElement(is_elem, f'{{{MAIN_NS}}}t')
-            t_elem.text = value
+    if template_sheet is None:
+        raise ValueError("Template sheet not found in workbook")
         
-        # 4. Serialize the modified sheet XML
-        modified_sheet_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        if LXML_AVAILABLE:
-            # tostring in lxml returns bytes, decode to unicode string
-            xml_bytes = LXML_ET.tostring(sheet_root, xml_declaration=False, encoding='utf-8')
-            modified_sheet_xml += xml_bytes.decode('utf-8')
-        else:
-            modified_sheet_xml += STD_ET.tostring(sheet_root, encoding='unicode')
+    # Apply cell updates
+    for (row, col), value in cell_updates.items():
+        template_sheet.cell(row=row, column=col, value=value)
         
-        # 5. Write output ZIP — copy everything, replace only the sheet file
-        output_buffer = io.BytesIO()
-        with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                if item.filename == sheet_path:
-                    zout.writestr(item, modified_sheet_xml.encode('utf-8'))
-                else:
-                    zout.writestr(item, zin.read(item.filename))
-        
-        return output_buffer.getvalue()
+    # Save to buffer
+    output_buffer = io.BytesIO()
+    wb.save(output_buffer)
+    wb.close()
+    return output_buffer.getvalue()
 
 
 st.write("")
@@ -657,11 +514,9 @@ if fill_clicked:
     if matched_count == 0 and unmatched_colours:
         st.error("No colours could be matched. Make sure the colour names in your Excel file match the scraped colour names exactly.")
     
-    # Generate the updated Excel using direct ZIP/XML (preserves all formatting)
+    # Generate the updated Excel
     if cell_updates:
-        if not LXML_AVAILABLE:
-            st.warning("⚠️ **Warning**: The `lxml` package is not installed on the server. Falling back to the standard XML processor. Note: **dropdowns and custom formatting might be stripped** from the final Excel file. To fix this, add `lxml` to your `requirements.txt` and reboot the app on Streamlit Cloud.")
-        with st.spinner("📝 Writing image URLs into Excel (preserving all formatting & dropdowns)..."):
+        with st.spinner("📝 Writing image URLs into Excel..."):
             try:
                 updated_bytes = fill_excel_preserve_formatting(original_bytes, cell_updates)
             except Exception as e:

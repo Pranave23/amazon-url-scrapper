@@ -610,10 +610,17 @@ if fill_clicked:
                 st.error(f"Failed to write Excel file: {e}")
                 st.stop()
         
+        # Determine dynamic output filename based on the uploaded file name
+        orig_filename = uploaded_excel.name
+        if orig_filename.endswith(".xlsx"):
+            out_filename = orig_filename[:-5] + "_filled.xlsx"
+        else:
+            out_filename = orig_filename + "_filled.xlsx"
+
         st.download_button(
             label="📥 Download Updated Excel File",
             data=updated_bytes,
-            file_name="Holdbacks_TEMU_filled.xlsx",
+            file_name=out_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=False
         )

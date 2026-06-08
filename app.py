@@ -345,7 +345,7 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
             break
             
     if template_sheet is None:
-        raise ValueError("Template sheet not found in workbook")
+        raise ValueError(f"Template sheet not found in workbook. Available sheets: {', '.join(wb.sheetnames)}")
         
     # Apply cell updates
     for (row, col), value in cell_updates.items():
@@ -448,7 +448,7 @@ if fill_clicked:
             break
     
     if template_sheet is None:
-        st.error("Could not find a sheet named 'Template' in the Excel file.")
+        st.error(f"Could not find a sheet named 'Template' in the Excel file. Available sheets: {', '.join(wb.sheetnames)}")
         st.stop()
     
     # Build a lookup: normalised colour name -> list of clean image URLs

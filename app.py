@@ -328,6 +328,23 @@ if st.session_state["scraped_data"] is not None:
 # EXCEL FILLER SECTION
 # ─────────────────────────────────────────────────────────────────
 
+def col_to_letter(col_num):
+    """Convert 1-based column number to Excel column letter(s)."""
+    result = ''
+    while col_num > 0:
+        col_num, remainder = divmod(col_num - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+def letter_to_col(letter):
+    """Convert Excel column letter(s) to 1-based column number."""
+    letter = letter.upper().strip()
+    num = 0
+    for c in letter:
+        if 'A' <= c <= 'Z':
+            num = num * 26 + (ord(c) - ord('A') + 1)
+    return num if num > 0 else 1
+
 def fill_excel_preserve_formatting(original_bytes, cell_updates):
     """
     Modify specific cells in the Template sheet of an xlsx file using openpyxl.
@@ -392,11 +409,74 @@ if json_source == "Upload a JSON file":
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Step 3: Configuration
-COLOUR_COL = 83   # Column CE — colour name
-IMG_START_COL = 96  # Column CR — first image URL slot
-IMG_END_COL = 105   # Column DA — last image URL slot (10 slots)
-DATA_START_ROW = 5  # First data row in the Template sheet
+# Excel Preview Table (renders dynamically when a file is uploaded)
+if uploaded_excel is not None:
+    try:
+        # Load a quick preview using openpyxl
+        wb_preview = openpyxl.load_workbook(io.BytesIO(uploaded_excel.getvalue()), read_only=True)
+        # Find the active or template sheet
+        preview_sheet = None
+        for name in wb_preview.sheetnames:
+            if "template" in name.lower():
+                preview_sheet = wb_preview[name]
+                break
+        if preview_sheet is None:
+            if len(wb_preview.sheetnames) > 0:
+                preview_sheet = wb_preview[wb_preview.sheetnames[0]]
+            
+        if preview_sheet is not None:
+            # Read the first few rows (e.g. headers and first data row)
+            preview_rows = []
+            for r_idx, row in enumerate(preview_sheet.iter_rows(max_row=5, values_only=True), 1):
+                if any(cell is not None for cell in row):
+                    preview_rows.append((r_idx, row))
+                    
+            if preview_rows:
+                st.markdown("### 📋 Excel Sheet Column Preview")
+                st.info("💡 Use this preview to identify which columns contain the **Colour Names** and where you want to write **Image URLs**.")
+                
+                # Find maximum columns that have non-empty values
+                max_cols_to_show = 0
+                for r_idx, r_val in preview_rows:
+                    non_empty_len = len(r_val)
+                    while non_empty_len > 0 and r_val[non_empty_len-1] is None:
+                        non_empty_len -= 1
+                    max_cols_to_show = max(max_cols_to_show, non_empty_len)
+                    
+                # Limit to showing max 15 columns for layout sanity
+                max_cols_to_show = min(max_cols_to_show, 15)
+                
+                headers = [f"Col {col_to_letter(c)}" for c in range(1, max_cols_to_show + 1)]
+                table_rows = []
+                for r_idx, r_val in preview_rows:
+                    row_cells = []
+                    for c in range(max_cols_to_show):
+                        val = r_val[c] if c < len(r_val) else None
+                        row_cells.append(str(val) if val is not None else "")
+                    table_rows.append(row_cells)
+                    
+                import pandas as pd
+                df_preview = pd.DataFrame(table_rows, columns=headers)
+                # Add Row index column
+                df_preview.insert(0, "Row #", [r[0] for r in preview_rows])
+                st.dataframe(df_preview, use_container_width=True, hide_index=True)
+                
+        wb_preview.close()
+    except Exception as e:
+        st.warning(f"Could not load preview table: {e}")
+
+# Step 3: Configuration Settings
+with st.expander("🛠️ Excel Column & Row Settings"):
+    st.info("💡 Match these settings with the column letters in the preview table above.")
+    col_letter = st.text_input("Colour Name Column Letter", value="CE", help="The column containing colour names (e.g. A, B, C, CE)")
+    img_start_letter = st.text_input("First Image URL Column Letter", value="CR", help="The column where the first image URL should be written")
+    img_end_letter = st.text_input("Last Image URL Column Letter", value="DA", help="The column where the last image URL should be written")
+    data_start_row = st.number_input("Data Start Row (1-indexed)", min_value=1, value=5, help="The row where actual product data begins (skipping headers)")
+
+COLOUR_COL = letter_to_col(col_letter)
+IMG_START_COL = letter_to_col(img_start_letter)
+IMG_END_COL = letter_to_col(img_end_letter)
+DATA_START_ROW = int(data_start_row)
 
 fill_clicked = st.button("🔄 Fill Image URLs into Excel", use_container_width=False)
 

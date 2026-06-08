@@ -371,7 +371,7 @@ def print_results(results: dict) -> None:
 # MAIN SCRAPER
 # ─────────────────────────────────────────────────────────────────
 
-async def scrape_amazon_images(url: str) -> dict:
+async def scrape_amazon_images(url: str, proxy_url: str = None) -> dict:
     """
     Scrape all colour variants and their high-resolution image URLs
     from an Amazon product page. Uses script-based parsing primarily
@@ -383,8 +383,32 @@ async def scrape_amazon_images(url: str) -> dict:
     
     results = {}
 
+    launch_kwargs = {"headless": True}
+    if proxy_url:
+        try:
+            parsed = urlparse(proxy_url)
+            # Reconstruct server part without credentials
+            scheme = parsed.scheme or "http"
+            hostname = parsed.hostname or ""
+            port = parsed.port
+            
+            server_str = f"{scheme}://{hostname}"
+            if port:
+                server_str += f":{port}"
+            
+            proxy_dict = {"server": server_str}
+            if parsed.username:
+                proxy_dict["username"] = parsed.username
+            if parsed.password:
+                proxy_dict["password"] = parsed.password
+                
+            launch_kwargs["proxy"] = proxy_dict
+            print(f"Using Playwright proxy: {server_str}")
+        except Exception as e:
+            print(f"Error parsing proxy URL: {e}")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 800},

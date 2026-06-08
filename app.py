@@ -8,6 +8,22 @@ import re
 import json
 import openpyxl
 from scraper import scrape_amazon_images
+import subprocess
+
+# Ensure Playwright browsers are installed on startup (crucial for Streamlit Cloud deployment)
+@st.cache_resource
+def install_playwright_browsers():
+    try:
+        # Try running playwright install chromium directly
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        # Fallback to running via python module if playwright is not in PATH
+        try:
+            subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+        except Exception as e2:
+            st.error(f"Failed to install Playwright browsers: {e2}")
+
+install_playwright_browsers()
 
 # Page Config
 st.set_page_config(
@@ -295,7 +311,7 @@ if st.session_state["scraped_data"] is not None:
 # EXCEL FILLER SECTION
 # ─────────────────────────────────────────────────────────────────
 
-import xml.etree.ElementTree as ET
+from lxml import etree as ET
 
 def col_to_letter(col_num):
     """Convert 1-based column number to Excel column letter(s)."""
@@ -326,13 +342,6 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
     with zipfile.ZipFile(input_buffer, 'r') as zin:
         # 1. Find the Template sheet's XML file path
         wb_xml = zin.read('xl/workbook.xml')
-        wb_xml_str = wb_xml.decode('utf-8')
-        
-        # Extract and register ALL namespaces to preserve them
-        ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', wb_xml_str)
-        for prefix, uri in ns_pairs:
-            ET.register_namespace(prefix if prefix else '', uri)
-        
         wb_root = ET.fromstring(wb_xml)
         
         # Find the Template sheet's relationship ID
@@ -366,14 +375,9 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
         
         # 2. Read and parse the sheet XML
         sheet_xml_bytes = zin.read(sheet_path)
-        sheet_xml_str = sheet_xml_bytes.decode('utf-8')
-        
-        # Extract and register sheet-level namespaces
-        sheet_ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', sheet_xml_str)
-        for prefix, uri in sheet_ns_pairs:
-            ET.register_namespace(prefix if prefix else '', uri)
-        
-        sheet_root = ET.fromstring(sheet_xml_bytes)
+        # Use lxml parser to preserve all formatting and spaces
+        parser = ET.XMLParser(remove_blank_text=False)
+        sheet_root = ET.fromstring(sheet_xml_bytes, parser=parser)
         
         # 3. Find <sheetData> and modify cells
         sheet_data = sheet_root.find(f'{{{MAIN_NS}}}sheetData')
@@ -425,7 +429,9 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
         
         # 4. Serialize the modified sheet XML
         modified_sheet_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        modified_sheet_xml += ET.tostring(sheet_root, encoding='unicode')
+        # tostring in lxml returns bytes, decode to unicode string
+        xml_bytes = ET.tostring(sheet_root, xml_declaration=False, encoding='utf-8')
+        modified_sheet_xml += xml_bytes.decode('utf-8')
         
         # 5. Write output ZIP — copy everything, replace only the sheet file
         output_buffer = io.BytesIO()

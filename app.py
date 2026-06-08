@@ -312,6 +312,7 @@ if st.session_state["scraped_data"] is not None:
 # ─────────────────────────────────────────────────────────────────
 
 try:
+    # pyrefly: ignore [missing-import]
     from lxml import etree as LXML_ET
     LXML_AVAILABLE = True
 except ImportError:

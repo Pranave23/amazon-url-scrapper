@@ -19,6 +19,7 @@ import asyncio
 import ast
 import json
 import re
+# pyrefly: ignore [missing-import]
 from playwright.async_api import async_playwright
 
 

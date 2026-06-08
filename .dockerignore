@@ -1,0 +1,11 @@
+venv/
+.git/
+.gitignore
+scraped_images.json
+__pycache__/
+.vscode/
+.DS_Store
+*.pyc
+*.pyo
+*.pyd
+*.db

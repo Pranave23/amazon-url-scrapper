@@ -311,7 +311,12 @@ if st.session_state["scraped_data"] is not None:
 # EXCEL FILLER SECTION
 # ─────────────────────────────────────────────────────────────────
 
-from lxml import etree as ET
+try:
+    from lxml import etree as LXML_ET
+    LXML_AVAILABLE = True
+except ImportError:
+    import xml.etree.ElementTree as STD_ET
+    LXML_AVAILABLE = False
 
 def col_to_letter(col_num):
     """Convert 1-based column number to Excel column letter(s)."""
@@ -342,7 +347,16 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
     with zipfile.ZipFile(input_buffer, 'r') as zin:
         # 1. Find the Template sheet's XML file path
         wb_xml = zin.read('xl/workbook.xml')
-        wb_root = ET.fromstring(wb_xml)
+        
+        if LXML_AVAILABLE:
+            wb_root = LXML_ET.fromstring(wb_xml)
+        else:
+            # Standard ElementTree namespace registration
+            wb_xml_str = wb_xml.decode('utf-8')
+            ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', wb_xml_str)
+            for prefix, uri in ns_pairs:
+                STD_ET.register_namespace(prefix if prefix else '', uri)
+            wb_root = STD_ET.fromstring(wb_xml)
         
         # Find the Template sheet's relationship ID
         template_rid = None
@@ -359,7 +373,10 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
         
         # Read workbook rels to find the actual sheet file path
         rels_xml = zin.read('xl/_rels/workbook.xml.rels')
-        rels_root = ET.fromstring(rels_xml)
+        if LXML_AVAILABLE:
+            rels_root = LXML_ET.fromstring(rels_xml)
+        else:
+            rels_root = STD_ET.fromstring(rels_xml)
         
         sheet_target = None
         for rel in rels_root:
@@ -375,9 +392,17 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
         
         # 2. Read and parse the sheet XML
         sheet_xml_bytes = zin.read(sheet_path)
-        # Use lxml parser to preserve all formatting and spaces
-        parser = ET.XMLParser(remove_blank_text=False)
-        sheet_root = ET.fromstring(sheet_xml_bytes, parser=parser)
+        
+        if LXML_AVAILABLE:
+            # Use lxml parser to preserve all formatting and spaces
+            parser = LXML_ET.XMLParser(remove_blank_text=False)
+            sheet_root = LXML_ET.fromstring(sheet_xml_bytes, parser=parser)
+        else:
+            sheet_xml_str = sheet_xml_bytes.decode('utf-8')
+            sheet_ns_pairs = re.findall(r'xmlns:?(\w*)=["\']([^"\']+)["\']', sheet_xml_str)
+            for prefix, uri in sheet_ns_pairs:
+                STD_ET.register_namespace(prefix if prefix else '', uri)
+            sheet_root = STD_ET.fromstring(sheet_xml_bytes)
         
         # 3. Find <sheetData> and modify cells
         sheet_data = sheet_root.find(f'{{{MAIN_NS}}}sheetData')
@@ -396,7 +421,10 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
             
             # Find or create the row element
             if row not in row_elements:
-                row_elem = ET.SubElement(sheet_data, f'{{{MAIN_NS}}}row')
+                if LXML_AVAILABLE:
+                    row_elem = LXML_ET.SubElement(sheet_data, f'{{{MAIN_NS}}}row')
+                else:
+                    row_elem = STD_ET.SubElement(sheet_data, f'{{{MAIN_NS}}}row')
                 row_elem.set('r', str(row))
                 row_elements[row] = row_elem
             else:
@@ -410,7 +438,10 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
                     break
             
             if cell_elem is None:
-                cell_elem = ET.SubElement(row_elem, f'{{{MAIN_NS}}}c')
+                if LXML_AVAILABLE:
+                    cell_elem = LXML_ET.SubElement(row_elem, f'{{{MAIN_NS}}}c')
+                else:
+                    cell_elem = STD_ET.SubElement(row_elem, f'{{{MAIN_NS}}}c')
                 cell_elem.set('r', cell_ref)
             
             # Clear existing content (value, formula, etc.)
@@ -423,15 +454,22 @@ def fill_excel_preserve_formatting(original_bytes, cell_updates):
             
             # Set as inline string (avoids modifying sharedStrings.xml)
             cell_elem.set('t', 'inlineStr')
-            is_elem = ET.SubElement(cell_elem, f'{{{MAIN_NS}}}is')
-            t_elem = ET.SubElement(is_elem, f'{{{MAIN_NS}}}t')
+            if LXML_AVAILABLE:
+                is_elem = LXML_ET.SubElement(cell_elem, f'{{{MAIN_NS}}}is')
+                t_elem = LXML_ET.SubElement(is_elem, f'{{{MAIN_NS}}}t')
+            else:
+                is_elem = STD_ET.SubElement(cell_elem, f'{{{MAIN_NS}}}is')
+                t_elem = STD_ET.SubElement(is_elem, f'{{{MAIN_NS}}}t')
             t_elem.text = value
         
         # 4. Serialize the modified sheet XML
         modified_sheet_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        # tostring in lxml returns bytes, decode to unicode string
-        xml_bytes = ET.tostring(sheet_root, xml_declaration=False, encoding='utf-8')
-        modified_sheet_xml += xml_bytes.decode('utf-8')
+        if LXML_AVAILABLE:
+            # tostring in lxml returns bytes, decode to unicode string
+            xml_bytes = LXML_ET.tostring(sheet_root, xml_declaration=False, encoding='utf-8')
+            modified_sheet_xml += xml_bytes.decode('utf-8')
+        else:
+            modified_sheet_xml += STD_ET.tostring(sheet_root, encoding='unicode')
         
         # 5. Write output ZIP — copy everything, replace only the sheet file
         output_buffer = io.BytesIO()
@@ -603,6 +641,8 @@ if fill_clicked:
     
     # Generate the updated Excel using direct ZIP/XML (preserves all formatting)
     if cell_updates:
+        if not LXML_AVAILABLE:
+            st.warning("⚠️ **Warning**: The `lxml` package is not installed on the server. Falling back to the standard XML processor. Note: **dropdowns and custom formatting might be stripped** from the final Excel file. To fix this, add `lxml` to your `requirements.txt` and reboot the app on Streamlit Cloud.")
         with st.spinner("📝 Writing image URLs into Excel (preserving all formatting & dropdowns)..."):
             try:
                 updated_bytes = fill_excel_preserve_formatting(original_bytes, cell_updates)

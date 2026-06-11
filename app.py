@@ -202,20 +202,6 @@ url_input = st.text_input(
     value=st.session_state["scraped_url"] if st.session_state["scraped_url"] else "",
     help="Paste the full Amazon product link here (handles amazon.com, amazon.co.uk, amazon.in, etc.)"
 )
-
-# Optional Proxy URL input
-with st.expander("🌐 Proxy Settings (Highly Recommended for Streamlit Cloud)"):
-    st.markdown("""
-    💡 **Why do I need a proxy?** 
-    Amazon actively blocks public cloud servers like Streamlit Cloud (AWS). To scrape directly from the cloud, you can route your requests through a residential proxy.
-    """)
-    proxy_input = st.text_input(
-        "Residential Proxy URL",
-        placeholder="http://username:password@proxy.example.com:8000",
-        value=st.session_state["proxy_url"] if st.session_state["proxy_url"] else "",
-        help="Supports HTTP/HTTPS/SOCKS5 formats: e.g., http://user:pass@host:port"
-    )
-    st.session_state["proxy_url"] = proxy_input
 st.markdown('</div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns([1, 4])

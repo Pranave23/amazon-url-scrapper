@@ -177,13 +177,22 @@ def download_and_zip_images(results: dict, source_url: str) -> bytes:
                     pass
     return zip_buffer.getvalue()
 
+import os
+
 # Initialize session state variables
 if "scraped_data" not in st.session_state:
     st.session_state["scraped_data"] = None
 if "scraped_url" not in st.session_state:
     st.session_state["scraped_url"] = ""
 if "proxy_url" not in st.session_state:
-    st.session_state["proxy_url"] = ""
+    # Try to load default proxy from environment variable or Streamlit secrets
+    default_proxy = os.environ.get("PROXY_URL", "")
+    if not default_proxy:
+        try:
+            default_proxy = st.secrets.get("PROXY_URL", "")
+        except Exception:
+            pass
+    st.session_state["proxy_url"] = default_proxy
 
 # Input Container
 st.markdown('<div class="search-card">', unsafe_allow_html=True)

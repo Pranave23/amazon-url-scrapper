@@ -193,12 +193,13 @@ async def get_colour_name(element) -> str:
                 return value
 
     try:
-        img = element.locator("img").first
-        alt = await img.get_attribute("alt")
-        if alt:
-            alt = alt.strip()
-            if not is_noise_label(alt) and not is_pagination_label(alt):
-                return alt
+        img_locator = element.locator("img")
+        if await img_locator.count() > 0:
+            alt = await img_locator.first.get_attribute("alt", timeout=500)
+            if alt:
+                alt = alt.strip()
+                if not is_noise_label(alt) and not is_pagination_label(alt):
+                    return alt
     except Exception:
         pass
 
@@ -416,28 +417,24 @@ async def scrape_amazon_images(url: str, proxy_url: str = None) -> dict:
         page = await context.new_page()
 
         try:
-            # ── 1. Load the page ──────────────────────────────────
+             # ── 1. Load the page ──────────────────────────────────
             print(f"\nOpening: {url}")
             try:
-                response = await page.goto(url, wait_until="load", timeout=60000)
+                # Wait for domcontentloaded instead of full load to speed it up significantly
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 if response is None or response.status != 200:
                     status = response.status if response else "None"
-                    print(f"Error: HTTP {status} — Amazon may be blocking this request.")
-                    return {}
+                    raise Exception(f"HTTP {status} — Amazon is blocking this request. A residential proxy is required for cloud hosting.")
             except Exception as e:
-                print(f"Error: Could not load page — {e}")
-                return {}
+                raise Exception(f"Could not load page — {e}. If this is a timeout, Amazon might be blocking the request.")
 
             # ── 2a. CAPTCHA and soft-block detection ──────────────
             if "captcha" in page.url.lower() or \
                await page.locator("input#captchacharacters").count() > 0:
-                print("Error: Amazon showed a CAPTCHA.")
-                print("Tip: Set headless=False, solve manually, then re-run.")
-                return {}
+                raise Exception("Amazon showed a CAPTCHA. Your proxy IP might be flagged.")
 
             if await page.locator("div#noResultsTitle").count() > 0:
-                print("Error: Amazon returned a soft-block page.")
-                return {}
+                raise Exception("Amazon returned a soft-block page.")
 
             # ── 2b. Cookie consent banner ─────────────────────────
             try:
@@ -511,7 +508,8 @@ async def scrape_amazon_images(url: str, proxy_url: str = None) -> dict:
                         print(f"Loading page for variant '{color}' (ASIN: {asin})...")
                         swatch_url = f"{base_url}/dp/{asin}/"
                         try:
-                            await page.goto(swatch_url, wait_until="load", timeout=30000)
+                            # Wait for domcontentloaded with a shorter timeout for swatches
+                            await page.goto(swatch_url, wait_until="domcontentloaded", timeout=15000)
                             swatch_html = await page.content()
                             swatch_color_images = extract_color_images(swatch_html)
                             if swatch_color_images and 'initial' in swatch_color_images:
